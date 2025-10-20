@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import MidiVisualizer from "./components/MidiVisualizer";
 import Auth from "./components/Auth";
+import './App.css'; // <-- IMPORT THE NEW CSS FILE
 
 const midiToNoteName = (midiNumber) => {
     if (midiNumber < 0 || midiNumber > 127) return "";
@@ -11,9 +12,16 @@ const midiToNoteName = (midiNumber) => {
 };
 
 function App() {
+    // --- Theme State ---
+    const [theme, setTheme] = useState('light');
+
     // --- Authentication State ---
     const [currentUser, setCurrentUser] = useState(null);
     const [authLoaded, setAuthLoaded] = useState(false);
+
+    // --- History State ---
+    const [history, setHistory] = useState([]);
+    const [isHistoryVisible, setIsHistoryVisible] = useState(true);
 
     // --- State Management ---
     const [file, setFile] = useState(null);
@@ -37,22 +45,42 @@ function App() {
 
     const [activeJobId, setActiveJobId] = useState(null);
 
-    // --- Refs ---
     const fileInputRef = useRef();
     const audioRef = useRef(null);
     const tabRef = useRef(null);
     const animationFrameRef = useRef(null);
-    const initialTabGenerationDone = useRef(false); // Ref to track if the first tab has been generated
+    const initialTabGenerationDone = useRef(false);
 
     const BACKEND_URL = "http://127.0.0.1:5001";
 
-    // Check session on page load
+    // --- Theme Effect ---
+    useEffect(() => {
+        document.body.className = theme;
+    }, [theme]);
+
+    const toggleTheme = () => {
+        setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
+    };
+
+    const fetchHistory = useCallback(async () => {
+        try {
+            const res = await fetch(`${BACKEND_URL}/api/my-jobs`, { credentials: 'include' });
+            if (res.ok) {
+                setHistory(await res.json());
+            }
+        } catch (err) {
+            console.error("Failed to fetch history:", err);
+        }
+    }, []);
+
+    // Check session on page load and fetch history
     useEffect(() => {
         const checkLoggedIn = async () => {
             try {
                 const res = await fetch(`${BACKEND_URL}/api/me`, { credentials: 'include' });
                 if (res.ok) {
                     setCurrentUser(await res.json());
+                    fetchHistory();
                 }
             } catch (err) {
                 console.error("Not logged in", err);
@@ -61,20 +89,16 @@ function App() {
             }
         };
         checkLoggedIn();
-    }, []);
+    }, [fetchHistory]);
 
-    // --- THIS IS THE FIX ---
-    // This effect listens for changes in the tabAlgorithm state.
+    // Re-generates tabs when algorithm is changed
     useEffect(() => {
-        // Only run this if the *initial* tab generation has already happened.
-        // This prevents it from running on the first render.
         if (initialTabGenerationDone.current) {
             handleGenerateTabs();
         }
-    }, [tabAlgorithm]); // The dependency array: this effect runs whenever 'tabAlgorithm' changes.
-    // --- END OF FIX ---
+    }, [tabAlgorithm]);
 
-    // Other effects (unchanged)
+    // Other effects (progress bar, tab scrolling)
     useEffect(() => {
         if (status === "processing" || status === "generating_tabs") {
             let current = 0;
@@ -104,19 +128,21 @@ function App() {
     // Authentication Handlers
     const handleAuthSuccess = (data) => {
         setCurrentUser(data.user);
+        fetchHistory();
     };
 
     const handleLogout = async () => {
         await fetch(`${BACKEND_URL}/api/logout`, { method: 'POST', credentials: 'include' });
         setCurrentUser(null);
+        setHistory([]);
         resetAll();
     };
 
-    // API Handlers
+    // API and History Handlers
     const handleGenerate = async (e) => {
         e.preventDefault();
         setError(null); setTabText(null); setMidiNotesData(null);
-        initialTabGenerationDone.current = false; // Reset the ref on new MIDI generation
+        initialTabGenerationDone.current = false;
         setStatus("processing"); setProgress(5);
 
         try {
@@ -142,6 +168,15 @@ function App() {
             setMidiFilename(data.midi_filename || null);
             setActiveJobId(data.job_id || null);
             setStatus("done");
+
+            const existingJobIndex = history.findIndex(job => job.job_id === data.job_id);
+            if (existingJobIndex > -1) {
+                const newHistory = [...history];
+                newHistory[existingJobIndex] = data;
+                setHistory(newHistory);
+            } else {
+                setHistory([data, ...history]);
+            }
 
             if (data.midi_filename) {
                 const notesResponse = await fetch(`${BACKEND_URL}/api/get_midi_notes`, {
@@ -179,9 +214,66 @@ function App() {
             if (!res.ok) throw new Error(j.error || "Tab generation failed");
             setTabText(j.tab_text || "");
             setStatus("tabs_ready");
-            initialTabGenerationDone.current = true; // Mark that the first tab generation is done
+            initialTabGenerationDone.current = true;
         } catch (err) {
             setError(err.message); setStatus("error");
+        }
+    };
+
+    const loadJob = (job) => {
+        resetAll();
+        setMidiUrl(job.midi_url);
+        setWavUrl(job.wav_url);
+        setMidiFilename(job.midi_filename);
+        setActiveJobId(job.job_id);
+        setStatus("done");
+
+        if (job.midi_filename) {
+            fetch(`${BACKEND_URL}/api/get_midi_notes`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ midi_filename: job.midi_filename })
+            }).then(res => res.json()).then(notes => setMidiNotesData(notes));
+        }
+        window.scrollTo(0, 0);
+    };
+
+    const handleRenameJob = async (jobId, oldTitle) => {
+        const newTitle = prompt("Enter a new name for this job:", oldTitle);
+        if (!newTitle || newTitle === oldTitle) return;
+
+        try {
+            const res = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ title: newTitle })
+            });
+            const updatedJob = await res.json();
+            if (!res.ok) throw new Error(updatedJob.error);
+
+            setHistory(history.map(job => job.job_id === jobId ? updatedJob : job));
+        } catch (err) {
+            setError(err.message);
+        }
+    };
+
+    const handleDeleteJob = async (jobId) => {
+        if (!window.confirm("Are you sure you want to delete this job? This cannot be undone.")) {
+            return;
+        }
+        try {
+            const res = await fetch(`${BACKEND_URL}/api/jobs/${jobId}`, {
+                method: 'DELETE',
+                credentials: 'include'
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error);
+
+            setHistory(history.filter(job => job.job_id !== jobId));
+        } catch (err) {
+            setError(err.message);
         }
     };
 
@@ -204,76 +296,168 @@ function App() {
     }
 
     return (
-        <div style={{ maxWidth: 900, margin: "40px auto", fontFamily: "Arial, sans-serif" }}>
-            <h1>🎶 StringScribe — Audio → MIDI → Tabs</h1>
+        <div className="app-container">
+            <div className="app-header">
+                <h1>🎶 StringScribe</h1>
+                <div className="theme-toggle">
+                    <span>Light</span>
+                    <label className="switch">
+                        <input type="checkbox" onChange={toggleTheme} checked={theme === 'dark'} />
+                        <span className="slider"></span>
+                    </label>
+                    <span>Dark</span>
+                </div>
+            </div>
 
             {!currentUser ? (
-                <Auth onAuthSuccess={handleAuthSuccess} />
+                <div className="card">
+                    <Auth onAuthSuccess={handleAuthSuccess} />
+                </div>
             ) : (
                 <>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-                        <strong>Welcome, {currentUser.username}!</strong>
-                        <button onClick={handleLogout} style={{ padding: "8px 16px", background: "#f44336", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>
+                    <div className="app-header">
+                        <h2>Welcome, {currentUser.username}!</h2>
+                        <button onClick={handleLogout} className="btn btn-delete">
                             Logout
                         </button>
                     </div>
 
-                    <form onSubmit={handleGenerate} style={{ border: "1px solid #ddd", padding: 20, borderRadius: 8, background: "#fafafa" }}>
-                        <h2>Input Options</h2>
-                        <div style={{ marginBottom: 12 }}><input type="text" value={youtubeUrl} onChange={(e) => { setYoutubeUrl(e.target.value); if (e.target.value) setFile(null); }} placeholder="Paste YouTube link (e.g. https://youtu.be/...)" style={{ width: "100%", padding: 8 }}/></div>
-                        <div style={{ marginBottom: 12 }}><input ref={fileInputRef} type="file" accept="audio/*" disabled={!!youtubeUrl} onChange={(e) => setFile(e.target.files[0])}/></div>
-                        <div><button type="submit" style={{ padding: "8px 16px", background: "#4caf50", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>Generate MIDI</button><button type="button" style={{ marginLeft: 12, padding: "8px 16px", background: "#ccc", border: "none", borderRadius: 4, cursor: "pointer" }} onClick={resetAll}>Reset</button></div>
-                        <h3 style={{marginTop: 20, marginBottom: 10}}>Model Parameters</h3>
-                        <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: "15px 20px"}}>
-                            <div><div style={{display: 'flex', justifyContent: 'space-between'}}><label>Onset Threshold</label><strong>{onsetThreshold.toFixed(1)}</strong></div><input type="range" step="0.1" min="0.1" max="0.9" value={onsetThreshold} onChange={(e) => setOnsetThreshold(parseFloat(e.target.value))} style={{width: "100%", marginTop: 8}}/></div>
-                            <div><div style={{display: 'flex', justifyContent: 'space-between'}}><label>Frame Threshold</label><strong>{frameThreshold.toFixed(1)}</strong></div><input type="range" step="0.1" min="0.1" max="0.9" value={frameThreshold} onChange={(e) => setFrameThreshold(parseFloat(e.target.value))} style={{width: "100%", marginTop: 8}}/></div>
-                            <div><div style={{display: 'flex', justifyContent: 'space-between'}}><label>Min. Note Length</label><strong>{minNoteLength} ms</strong></div><input type="range" step="10" min="50" max="500" value={minNoteLength} onChange={(e) => setMinNoteLength(parseInt(e.target.value))} style={{width: "100%", marginTop: 8}}/></div>
-                        </div>
-                        <h3 style={{marginTop: 20, marginBottom: 10}}>Pitch Range</h3>
-                        <div style={{display: "grid", gridTemplateColumns: "1fr 1fr", gap: "15px 20px"}}>
-                            <div><div style={{display: 'flex', justifyContent: 'space-between'}}><label>Min Pitch</label><strong>{midiToNoteName(minPitch)}</strong></div><input type="range" step="1" min="0" max="127" value={minPitch} onChange={(e) => setMinPitch(Math.min(parseInt(e.target.value), maxPitch - 1))} style={{width: "100%", marginTop: 8}}/></div>
-                            <div><div style={{display: 'flex', justifyContent: 'space-between'}}><label>Max Pitch</label><strong>{midiToNoteName(maxPitch)}</strong></div><input type="range" step="1" min="0" max="127" value={maxPitch} onChange={(e) => setMaxPitch(Math.max(parseInt(e.target.value), minPitch + 1))} style={{width: "100%", marginTop: 8}}/></div>
-                        </div>
-                    </form>
-
-                    <div style={{ marginTop: 20 }}><strong>Status:</strong> {status}{progress > 0 && ( <div style={{ height: 10, width: "100%", background: "#eee", borderRadius: 4, marginTop: 8 }}><div style={{ height: "100%", width: `${progress}%`, background: "#4caf50", borderRadius: 4, transition: "width 0.4s ease" }}/></div>)}</div>
-                    {(status === "processing" || status === "generating_tabs") && ( <div style={{ marginTop: 20, textAlign: "center" }}><div style={{ width: 50, height: 50, border: "5px solid #ccc", borderTop: "5px solid #4caf50", borderRadius: "50%", animation: "spin 1s linear infinite", margin: "15px auto" }}/><p>Processing your audio...</p></div>)}
-                    <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
-                    {error && <div style={{ marginTop: 12, color: "red" }}>Error: {error}</div>}
-
-                    <div style={{ marginTop: 20 }}>
-                        {wavUrl && (<div><h3>🎧 Sonified Output</h3><audio ref={audioRef} controls src={wavUrl} key={wavUrl} style={{ width: "100%" }} /></div>)}
-                        {midiNotesData && (
-                            <div style={{ marginTop: '20px', padding: '15px', background: '#f7f7f7', borderRadius: '8px', border: '1px solid #e0e0e0' }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}><h3 style={{ margin: 0, fontSize: '1.2em', color: '#333' }}>🎵 MIDI Output</h3></div>
-                                <div style={{ marginTop: '20px' }}><MidiVisualizer notesData={midiNotesData} audioRef={audioRef} /></div>
+                    <div className="card">
+                        <form onSubmit={handleGenerate}>
+                            <h2>Input Options</h2>
+                            <div style={{ marginBottom: 16 }}>
+                                <input className="input-field" type="text" value={youtubeUrl} onChange={(e) => { setYoutubeUrl(e.target.value); if (e.target.value) setFile(null); }} placeholder="Paste YouTube link (e.g. https://youtu.be/...)" />
                             </div>
-                        )}
-
-                        {activeJobId && (status === 'done' || status === 'tabs_ready') && !tabText && (
-                            <div style={{ marginTop: 20 }}>
-                                <button onClick={handleGenerateTabs} style={{ padding: "8px 16px", background: "#2196f3", color: "white", border: "none", borderRadius: 4, cursor: "pointer" }}>Generate Tabs</button>
+                            <div style={{ marginBottom: 24 }}>
+                                <label className="file-input-label" htmlFor="audio-file">
+                                    {file ? file.name : <span>Or click to upload an audio file</span>}
+                                </label>
+                                <input ref={fileInputRef} id="audio-file" type="file" accept="audio/*" disabled={!!youtubeUrl} onChange={(e) => setFile(e.target.files[0])} style={{ display: 'none' }} />
                             </div>
-                        )}
 
-                        {tabText && (
-                            <div style={{ marginTop: 20 }}>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f0f0f0', padding: '10px 12px', borderRadius: '4px 4px 0 0', borderBottom: '1px solid #ddd' }}>
-                                    <h3 style={{ margin: 0, fontSize: '1.1em' }}>🎸 Generated Tabs</h3>
-                                    <div style={{ display: 'flex', gap: '15px', alignItems: 'center' }}>
-                                        <span style={{ fontSize: '0.9em', color: '#555' }}>Algorithm:</span>
-                                        <label style={{ cursor: 'pointer', fontWeight: tabAlgorithm === 'efficient' ? 'bold' : 'normal' }}><input type="radio" value="efficient" checked={tabAlgorithm === "efficient"} onChange={(e) => setTabAlgorithm(e.target.value)} /> Efficient</label>
-                                        <label style={{ cursor: 'pointer', fontWeight: tabAlgorithm === 'simple' ? 'bold' : 'normal' }}><input type="radio" value="simple" checked={tabAlgorithm === "simple"} onChange={(e) => setTabAlgorithm(e.target.value)} /> Simple</label>
+                            <h3>Model Parameters</h3>
+                            <div className="form-grid">
+                                <div className="form-group">
+                                    <div className="form-group-header"><label>Onset Threshold</label><strong>{onsetThreshold.toFixed(1)}</strong></div>
+                                    <input type="range" step="0.1" min="0.1" max="0.9" value={onsetThreshold} onChange={(e) => setOnsetThreshold(parseFloat(e.target.value))} />
+                                </div>
+                                <div className="form-group">
+                                    <div className="form-group-header"><label>Frame Threshold</label><strong>{frameThreshold.toFixed(1)}</strong></div>
+                                    <input type="range" step="0.1" min="0.1" max="0.9" value={frameThreshold} onChange={(e) => setFrameThreshold(parseFloat(e.target.value))} />
+                                </div>
+                                <div className="form-group">
+                                    <div className="form-group-header"><label>Min. Note Length</label><strong>{minNoteLength} ms</strong></div>
+                                    <input type="range" step="10" min="50" max="500" value={minNoteLength} onChange={(e) => setMinNoteLength(parseInt(e.target.value))} />
+                                </div>
+                            </div>
+
+                            <h3 style={{marginTop: 24}}>Pitch Range</h3>
+                            <div className="form-grid">
+                                <div className="form-group">
+                                    <div className="form-group-header"><label>Min Pitch</label><strong>{midiToNoteName(minPitch)}</strong></div>
+                                    <input type="range" step="1" min="0" max="127" value={minPitch} onChange={(e) => setMinPitch(Math.min(parseInt(e.target.value), maxPitch - 1))} />
+                                </div>
+                                <div className="form-group">
+                                    <div className="form-group-header"><label>Max Pitch</label><strong>{midiToNoteName(maxPitch)}</strong></div>
+                                    <input type="range" step="1" min="0" max="127" value={maxPitch} onChange={(e) => setMaxPitch(Math.max(parseInt(e.target.value), minPitch + 1))} />
+                                </div>
+                            </div>
+
+                            <div className="button-group">
+                                <button type="submit" className="btn btn-primary">Generate MIDI</button>
+                                <button type="button" className="btn btn-secondary" onClick={resetAll}>Reset</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    {status !== 'idle' && status !== 'done' && (
+                        <div className="card">
+                            <div className="status-bar"><strong>Status:</strong> {status}</div>
+                            {progress > 0 && (
+                                <div className="progress-bar">
+                                    <div className="progress-bar-inner" style={{ width: `${progress}%` }}/>
+                                </div>
+                            )}
+                            {(status === "processing" || status === "generating_tabs") && (
+                                <div style={{ textAlign: "center" }}>
+                                    <div className="spinner" />
+                                    <p>Processing your audio...</p>
+                                </div>
+                            )}
+                            {error && <div className="error-message">Error: {error}</div>}
+                        </div>
+                    )}
+
+                    {(wavUrl || midiNotesData || tabText) && (
+                        <div className="card">
+                            <h2>Results</h2>
+                            {wavUrl && (
+                                <>
+                                    <h3>🎧 Sonified Output</h3>
+                                    <audio ref={audioRef} controls src={wavUrl} key={wavUrl} style={{ width: "100%" }} />
+                                </>
+                            )}
+                            {midiNotesData && (
+                                <>
+                                    <h3 style={{marginTop: 24}}>🎵 MIDI Output</h3>
+                                    <MidiVisualizer notesData={midiNotesData} audioRef={audioRef} />
+                                </>
+                            )}
+
+                            {activeJobId && (status === 'done' || status === 'tabs_ready') && !tabText && (
+                                <div className="button-group">
+                                    <button onClick={handleGenerateTabs} className="btn btn-primary">Generate Tabs</button>
+                                </div>
+                            )}
+
+                            {tabText && (
+                                <>
+                                    <div className="tab-header">
+                                        <h3>🎸 Generated Tabs</h3>
+                                        <div className="radio-group">
+                                            <span>Algorithm:</span>
+                                            <label><input type="radio" value="efficient" checked={tabAlgorithm === "efficient"} onChange={(e) => setTabAlgorithm(e.target.value)} /> Efficient</label>
+                                            <label><input type="radio" value="simple" checked={tabAlgorithm === "simple"} onChange={(e) => setTabAlgorithm(e.target.value)} /> Simple</label>
+                                        </div>
                                     </div>
-                                </div>
-                                <div style={{ background: '#f0f0f0', padding: '10px 12px', borderBottom: '1px solid #ddd', display: 'flex', alignItems: 'center', gap: '15px' }}>
-                                    <button onClick={() => setIsTabScrolling(!isTabScrolling)} style={{ padding: '4px 10px', minWidth: '80px' }}>{isTabScrolling ? 'Stop' : 'Start'} Scroll</button>
-                                    <button onClick={() => { setIsTabScrolling(false); if(tabRef.current) tabRef.current.scrollLeft = 0; }} style={{ padding: '4px 10px' }}>Reset</button>
-                                    <label style={{ marginLeft: 'auto' }}>Speed:</label>
-                                    <input type="range" min="1" max="100" value={scrollSpeed} onChange={(e) => setScrollSpeed(parseInt(e.target.value))} style={{ width: '150px' }} />
-                                </div>
-                                <pre ref={tabRef} style={{ whiteSpace: "pre", overflowX: "auto", background: "#f0f0f0", padding: 12, borderRadius: '0 0 4px 4px', margin: 0 }}>{tabText}</pre>
-                            </div>
+                                    <div className="tab-controls">
+                                        <button className="btn btn-small" onClick={() => setIsTabScrolling(!isTabScrolling)}>{isTabScrolling ? 'Stop' : 'Start'} Scroll</button>
+                                        <button className="btn btn-small" onClick={() => { setIsTabScrolling(false); if(tabRef.current) tabRef.current.scrollLeft = 0; }}>Reset</button>
+                                        <label>Speed:</label>
+                                        <input type="range" min="1" max="100" value={scrollSpeed} onChange={(e) => setScrollSpeed(parseInt(e.target.value))} style={{ width: '150px' }} />
+                                    </div>
+                                    <pre ref={tabRef} className="tab-content">{tabText}</pre>
+                                </>
+                            )}
+                        </div>
+                    )}
+
+                    <div className="card">
+                        <h2 className="history-title" onClick={() => setIsHistoryVisible(!isHistoryVisible)}>
+                            <span>My Processed MIDI</span>
+                            <span style={{ fontSize: '0.8em' }}>{isHistoryVisible ? '▼' : '►'}</span>
+                        </h2>
+
+                        {isHistoryVisible && (
+                            history.length === 0 ? (
+                                <p>You haven't processed any audio yet.</p>
+                            ) : (
+                                <ul className="history-list">
+                                    {history.map(job => (
+                                        <li key={job.job_id} className="history-item">
+                                            <div className="history-item-info">
+                                                <strong>{job.title}</strong>
+                                                <div>{new Date(job.created_at).toLocaleString()}</div>
+                                            </div>
+                                            <div>
+                                                <button onClick={() => loadJob(job)} className="btn btn-small btn-load btn-action">Load</button>
+                                                <button onClick={() => handleRenameJob(job.job_id, job.title)} className="btn btn-small btn-rename btn-action">Rename</button>
+                                                <button onClick={() => handleDeleteJob(job.job_id)} className="btn btn-small btn-delete">Delete</button>
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )
                         )}
                     </div>
                 </>

@@ -44,40 +44,48 @@ def get_me():
     # ... (code from previous step)
     return jsonify({"id": current_user.id, "username": current_user.username, "email": current_user.email}), 200
 
-# --- NEW: CORE APPLICATION ROUTES ---
 
 @api.route("/static/processed/<path:filename>")
 def serve_processed_file(filename):
     """Serves the generated MIDI and WAV files."""
     return send_from_directory(current_app.config['PROCESSED_FILES_DIR'], filename)
 
+# This function goes inside backend/app/routes.py
+
 @api.route("/process", methods=["POST"])
 @login_required
 def process_request():
     """
     Handles audio file/URL submission.
-    Creates a new AudioProcessingJob or overwrites an existing one.
+    Creates a new AudioProcessingJob or overwrites an existing one for the current user.
     """
     user_id = current_user.id
     data = request.form.to_dict()
 
+    # Use the helper function from services.py to get a unique hash for the audio source
     source_hash, source_info, temp_file_path = get_source_hash(request)
     if not source_hash:
         return jsonify({"error": "No audio file or YouTube URL provided"}), 400
 
+    # Check if a job for this exact audio source already exists for this user
     existing_job = AudioProcessingJob.query.filter_by(
         user_id=user_id, source_hash=source_hash
     ).first()
 
+    # Forward the audio to the processor service to get the MIDI and WAV files
     processor_data, error = forward_to_processor(data, temp_file_path)
     if error:
         return jsonify({"error": error}), 503
 
     if existing_job:
-        print(f"OVERWRITING existing job {existing_job.id}")
-        delete_job_files(existing_job) # Delete old .mid/.wav files
+        # If a job exists, we overwrite it (destructive update)
+        print(f"OVERWRITING existing job {existing_job.id} for user {user_id}")
 
-        # Update the existing job record
+        # 1. Delete the old physical .mid and .wav files from the server
+        delete_job_files(existing_job)
+
+        # 2. Update the existing database record with the new information
+        existing_job.title = source_info  # Reset the title to the new source info
         existing_job.source_info = source_info
         existing_job.midi_relative_path = processor_data.get('midi_relative_path')
         existing_job.wav_relative_path = processor_data.get('wav_relative_path')
@@ -87,9 +95,12 @@ def process_request():
         db.session.commit()
         job_to_return = existing_job
     else:
-        print("CREATING new job")
+        # If no job exists, we create a new one
+        print(f"CREATING new job for user {user_id}")
+
         new_job = AudioProcessingJob(
             user_id=user_id,
+            title=source_info,  # Use the source info as the default title
             source_hash=source_hash,
             source_info=source_info,
             midi_relative_path=processor_data.get('midi_relative_path'),
@@ -100,11 +111,8 @@ def process_request():
         db.session.commit()
         job_to_return = new_job
 
-    return jsonify({
-        "job_id": job_to_return.id,
-        "midi_filename": job_to_return.midi_filename,
-        **job_to_return.get_urls()
-    }), 200
+    # Return the full job object to the frontend
+    return jsonify(job_to_return.to_dict()), 200
 
 @api.route("/generate_tabs", methods=["POST"])
 @login_required
@@ -126,15 +134,6 @@ def generate_tabs_proxy():
 
     tab_data = resp.json()
 
-    # Create a new TabGeneration record
-    new_tab = TabGeneration(
-        job_id=job.id,
-        algorithm=algorithm,
-        tab_text=tab_data.get('tab_text')
-    )
-    db.session.add(new_tab)
-    db.session.commit()
-
     # We will add renaming and history later. For now, just return the text.
     return jsonify(tab_data), 201
 
@@ -144,3 +143,47 @@ def get_midi_notes_proxy():
     """Proxies the request to get MIDI note data for the visualizer."""
     resp = requests.post(current_app.config['PROCESSOR_URL_NOTES'], json=request.json)
     return jsonify(resp.json()), resp.status_code
+
+@api.route("/my-jobs", methods=["GET"])
+@login_required
+def get_my_jobs():
+    """Fetches all audio processing jobs for the current user."""
+    jobs = AudioProcessingJob.query.filter_by(
+        user_id=current_user.id
+    ).order_by(AudioProcessingJob.created_at.desc()).all()
+
+    return jsonify([j.to_dict() for j in jobs]), 200
+
+@api.route("/jobs/<int:job_id>", methods=["PUT"])
+@login_required
+def rename_job(job_id):
+    """Renames a specific audio processing job."""
+    new_title = request.json.get('title')
+    if not new_title:
+        return jsonify({"error": "New title is required"}), 400
+
+    job = AudioProcessingJob.query.get(job_id)
+    if not job or job.user_id != current_user.id:
+        return jsonify({"error": "Job not found or you do not own it"}), 404
+
+    job.title = new_title
+    db.session.commit()
+
+    return jsonify(job.to_dict()), 200
+
+@api.route("/jobs/<int:job_id>", methods=["DELETE"])
+@login_required
+def delete_job(job_id):
+    """Deletes a job, its child tabs, and its physical files."""
+    job = AudioProcessingJob.query.get(job_id)
+    if not job or job.user_id != current_user.id:
+        return jsonify({"error": "Job not found or you do not own it"}), 404
+
+    # Delete the physical .mid and .wav files first
+    delete_job_files(job)
+
+    # The 'cascade' option in the model will automatically delete child TabGenerations
+    db.session.delete(job)
+    db.session.commit()
+
+    return jsonify({"message": "Job deleted successfully"}), 200
