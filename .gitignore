@@ -1,0 +1,22 @@
+# Python virtual environment
+venv/
+*.pyc
+__pycache__/
+.env
+
+# Node.js dependencies (very important to ignore)
+Frontend/node_modules/
+Frontend/build/
+.DS_Store
+
+# IDE and editor configuration files
+.idea/
+.vscode/
+
+# --- Project-Specific Generated Files ---
+# Ignore all files created by the processor service.
+# These are generated on the fly and should not be in source control.
+audio-tab-processor/processed_files/
+
+# Ignore any temporary uploads shared between services.
+shared_uploads/
